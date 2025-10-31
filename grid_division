@@ -1,0 +1,142 @@
+@ -1,142 +0,0 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import pandas as pd
+
+# ---------------------- STEP 1: Load your input CSV ----------------------
+# Replace this path with your own file
+
+csv_path = r"C:\Users\Tanya N\Downloads\5Years_SF_calls.csv"  # example filename
+
+calls_df = pd.read_csv(csv_path)
+
+
+def add_lat_lng_from_point(
+    df: pd.DataFrame,
+    src_col: str = "case_location",
+    lat_col: str = "lat",
+    lng_col: str = "lng",
+    overwrite: bool = True,
+    drop_invalid: bool = False
+) -> pd.DataFrame:
+    """
+    Parse WKT POINT strings (format: 'POINT (lng lat)') into numeric lat/lng columns.
+
+    Params:
+      df            : DataFrame containing src_col
+      src_col       : column with WKT strings, e.g., 'POINT (-122.4046 37.7777)'
+      lat_col/lng_col: output column names
+      overwrite     : if False and lat/lng already exist, leave them as-is
+      drop_invalid  : if True, drop rows where parsing fails; else leave NaN
+
+    Returns:
+      New DataFrame with lat_col and lng_col as float columns.
+    """
+    if src_col not in df.columns:
+        raise ValueError(f"Column '{src_col}' not found")
+
+    if not overwrite and (lat_col in df.columns or lng_col in df.columns):
+        return df
+
+    # case-insensitive, tolerant to spaces
+    pattern = re.compile(r"^\s*POINT\s*\(\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\)\s*$", re.IGNORECASE)
+
+    def parse_one(val):
+        if isinstance(val, str):
+            m = pattern.match(val)
+            if m:
+                lng, lat = m.groups()
+                return float(lat), float(lng)
+        return (float("nan"), float("nan"))
+
+    out = df.copy()
+    out[[lat_col, lng_col]] = out[src_col].apply(lambda v: pd.Series(parse_one(v)))
+
+    if drop_invalid:
+        out = out.dropna(subset=[lat_col, lng_col])
+
+    return out
+
+
+# If lat/lng aren't present but a WKT point column exists, try to parse it
+required_cols = {'lat', 'lng'}
+if not required_cols.issubset(calls_df.columns):
+    # attempt to parse from a common WKT column name
+    wkt_candidates = ["case_location", "location", "point", "geom"]
+    found = None
+    for c in wkt_candidates:
+        if c in calls_df.columns:
+            found = c
+            break
+
+    if found:
+        print(f"Parsing lat/lng from WKT column '{found}'...")
+        calls_df = add_lat_lng_from_point(calls_df, src_col=found, drop_invalid=True)
+    else:
+        raise ValueError("CSV must have 'lat' and 'lng' columns or a WKT point column (e.g. 'case_location')")
+
+# ---------------------- STEP 2: Make a square bounding box ----------------------
+def square_bounds_from_calls(calls_df, lat_col="lat", lng_col="lng", pad_ratio=0.0):
+    if calls_df.empty:
+        raise ValueError("calls_df is empty")
+    
+    lat_min = calls_df[lat_col].min()
+    lat_max = calls_df[lat_col].max()
+    lng_min = calls_df[lng_col].min()
+    lng_max = calls_df[lng_col].max()
+
+    lat_span = lat_max - lat_min
+    lng_span = lng_max - lng_min
+    side = max(lat_span, lng_span) * (1 + pad_ratio)
+
+    lat_center = (lat_min + lat_max) / 2.0
+    lng_center = (lng_min + lng_max) / 2.0
+
+    lat_min_s = lat_center - side / 2.0
+    lat_max_s = lat_center + side / 2.0
+    lng_min_s = lng_center - side / 2.0
+    lng_max_s = lng_center + side / 2.0
+    return lat_min_s, lat_max_s, lng_min_s, lng_max_s
+
+
+# ---------------------- STEP 3: Create grid edges ----------------------
+def grid_edges_2d(lat_min, lat_max, lng_min, lng_max, n_rows=5, n_cols=5):
+    lat_edges = np.linspace(lat_min, lat_max, n_rows + 1)
+    lng_edges = np.linspace(lng_min, lng_max, n_cols + 1)
+    return lat_edges, lng_edges
+
+
+# ---------------------- STEP 4: Draw only the grid ----------------------
+def draw_grid(lat_edges, lng_edges, figsize=(6,6), title="Square 5x5 Grid"):
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_xlim(lng_edges[0], lng_edges[-1])
+    ax.set_ylim(lat_edges[0], lat_edges[-1])
+
+    # Draw grid lines
+    for x in lng_edges:
+        ax.axvline(x, color="gray", linewidth=0.8)
+    for y in lat_edges:
+        ax.axhline(y, color="gray", linewidth=0.8)
+
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(title)
+    ax.set_aspect("equal", adjustable="box")
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------- STEP 5: Run everything ----------------------
+lat_min_s, lat_max_s, lng_min_s, lng_max_s = square_bounds_from_calls(calls_df)
+lat_edges, lng_edges = grid_edges_2d(lat_min_s, lat_max_s, lng_min_s, lng_max_s, n_rows=5, n_cols=5)
+draw_grid(lat_edges, lng_edges, title="5x5 Square Grid Based on Call Area")
+
+
+res = {
+    "lat_edges": lat_edges.tolist(),
+    "lng_edges": lng_edges.tolist()
+}
+import json
+json.dump(res, open("grid_edges.json", "w"))
