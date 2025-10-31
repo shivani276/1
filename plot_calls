@@ -1,0 +1,104 @@
+@ -1,103 +0,0 @@
+# plot_calls_with_grid_clean.py
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+CSV = r"C:\Users\Tanya N\Downloads\Montgomery_calls.csv"
+ROWS = 5
+COLS = 5
+PAD = 0.00         # extra margin around the square
+ROBUST = True      # use percentiles to ignore extreme outliers for the grid box
+
+def standardize_columns(df):
+    # Accept common variants
+    cols = {c.lower(): c for c in df.columns}
+    lat_name = cols.get("lat") or cols.get("latitude")
+    lng_name = cols.get("lng") or cols.get("long") or cols.get("longitude")
+    if not lat_name or not lng_name:
+        raise ValueError("CSV must have columns named lat/lng or latitude/longitude or long.")
+    return df.rename(columns={lat_name: "lat", lng_name: "lng"})
+
+def fix_lat_lng(df):
+    df = df.copy()
+    # 1) Drop obvious junk
+    df = df[["lat","lng"]].dropna()
+    df = df[(df["lat"].abs() <= 180) & (df["lng"].abs() <= 180)].copy()
+
+    # 2) Swap rows where it looks like lat and lng got flipped
+    swap_mask = (df["lat"].abs() > 90) & (df["lng"].abs() <= 90)
+    if swap_mask.any():
+        lat_tmp = df.loc[swap_mask, "lat"].copy()
+        df.loc[swap_mask, "lat"] = df.loc[swap_mask, "lng"].values
+        df.loc[swap_mask, "lng"] = lat_tmp.values
+
+    # 3) Force correct hemisphere for Montgomery: lat positive, lng negative
+    df.loc[df["lat"] < 0, "lat"] = df.loc[df["lat"] < 0, "lat"].abs()
+    df.loc[df["lng"] > 0, "lng"] = -df.loc[df["lng"] > 0, "lng"].abs()
+
+    # 4) After fixes, keep only valid geographic ranges
+    df = df[(df["lat"].between(-90, 90)) & (df["lng"].between(-180, 180))].copy()
+    return df
+
+def square_bounds_from_calls(df, pad_ratio=0.0, robust=False):
+    if robust:
+        lat_min, lat_max = df["lat"].quantile([0.01, 0.99])
+        lng_min, lng_max = df["lng"].quantile([0.01, 0.99])
+    else:
+        lat_min, lat_max = df["lat"].min(), df["lat"].max()
+        lng_min, lng_max = df["lng"].min(), df["lng"].max()
+
+    lat_span = lat_max - lat_min
+    lng_span = lng_max - lng_min
+    side = max(lat_span, lng_span) * (1 + pad_ratio)
+
+    lat_c = (lat_min + lat_max) / 2.0
+    lng_c = (lng_min + lng_max) / 2.0
+
+    return lat_c - side/2, lat_c + side/2, lng_c - side/2, lng_c + side/2
+
+def grid_edges_2d(lat_min, lat_max, lng_min, lng_max, n_rows=5, n_cols=5):
+    lat_edges = np.linspace(lat_min, lat_max, n_rows + 1)
+    lng_edges = np.linspace(lng_min, lng_max, n_cols + 1)
+    return lat_edges, lng_edges
+
+def draw_grid(ax, lat_edges, lng_edges):
+    ax.set_xlim(lng_edges[0], lng_edges[-1])
+    ax.set_ylim(lat_edges[0], lat_edges[-1])
+    for x in lng_edges: ax.axvline(x, linewidth=0.7, alpha=0.6)
+    for y in lat_edges: ax.axhline(y, linewidth=0.7, alpha=0.6)
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="box")
+
+def main():
+    raw = pd.read_csv(CSV)
+    raw = standardize_columns(raw)
+
+    total = len(raw)
+    df = fix_lat_lng(raw)
+    cleaned = len(df)
+
+    # Build square grid from cleaned calls
+    lat_min, lat_max, lng_min, lng_max = square_bounds_from_calls(df, pad_ratio=PAD, robust=ROBUST)
+    lat_edges, lng_edges = grid_edges_2d(lat_min, lat_max, lng_min, lng_max, ROWS, COLS)
+
+    # All cleaned calls should be inside by construction, but clip to be safe
+    in_sq = df[
+        (df.lat >= lat_edges[0]) & (df.lat <= lat_edges[-1]) &
+        (df.lng >= lng_edges[0]) & (df.lng <= lng_edges[-1])
+    ].copy()
+
+    print(f"Rows in CSV: {total}")
+    print(f"Usable after cleaning: {cleaned}")
+    print(f"Plotted inside grid: {len(in_sq)}")
+    print(f"Grid lat range: {lat_edges[0]:.6f} .. {lat_edges[-1]:.6f}")
+    print(f"Grid lng range: {lng_edges[0]:.6f} .. {lng_edges[-1]:.6f}")
+
+    fig, ax = plt.subplots(figsize=(7,7))
+    draw_grid(ax, lat_edges, lng_edges)
+    ax.scatter(in_sq["lng"], in_sq["lat"], s=6, alpha=0.6)
+    ax.set_title("Calls over 5×5 Grid")
+    plt.tight_layout(); plt.show()
+
+if __name__ == "__main__":
+    main()
