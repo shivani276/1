@@ -1,0 +1,249 @@
+# timeslot is distance between center of 2 grids not fixed 
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+def generate_combined_calls(
+    calls_df, 
+    timestamp_col, 
+    lat_col, 
+    lng_col, 
+    grids_lat=4, 
+    grids_lng=4, 
+    avg_speed_kmh=60.0
+    
+):
+    
+    # --- 1. CALCULATE ACTUAL 5x5 COUNTS ---
+    if calls_df.empty:
+        print("DataFrame is empty. Cannot perform analysis.")
+        return
+
+    lat_min, lat_max = calls_df[lat_col].min(), calls_df[lat_col].max()
+    lng_min, lng_max = calls_df[lng_col].min(), calls_df[lng_col].max()
+    lat_step = (lat_max - lat_min) / grids_lat
+    lng_step = (lng_max - lng_min) / grids_lng
+    latitude_divisions = [lat_min + i * lat_step for i in range(grids_lat + 1)]
+    longitude_divisions = [lng_min + i * lng_step for i in range(grids_lng + 1)]
+    C_ij = np.zeros((grids_lat, grids_lng)) 
+    cell_data_pools = {} # This is no longer used for sampling, but kept for structure
+
+    for i in range(grids_lat):
+        lat_start, lat_end = latitude_divisions[i], latitude_divisions[i+1]
+        for j in range(grids_lng):
+            lng_start, lng_end = longitude_divisions[j], longitude_divisions[j+1]
+            lat_filter = (calls_df[lat_col] >= lat_start) & (calls_df[lat_col] <= lat_end if i == grids_lat - 1 else calls_df[lat_col] < lat_end)
+            lng_filter = (calls_df[lng_col] >= lng_start) & (calls_df[lng_col] <= lng_end if j == grids_lng - 1 else calls_df[lng_col] < lng_end)
+            cell_calls = calls_df[lat_filter & lng_filter]
+            C_ij[i, j] = len(cell_calls)
+            
+            # This logic is no longer needed without simulation, but doesn't hurt
+            if not cell_calls.empty:
+                cell_data_pools[(i, j)] = cell_calls
+            else:
+                cell_data_pools[(i, j)] = calls_df
+
+    # --- 1.5. CALCULATE TIMESLOT DURATION ---
+    lat_centers = [ (latitude_divisions[i] + latitude_divisions[i+1]) / 2 for i in range(grids_lat) ]
+    lng_centers = [ (longitude_divisions[j] + longitude_divisions[j+1]) / 2 for j in range(grids_lng) ]
+    timeslot_distance_deg = ((lat_centers[0] - lat_centers[0])**2 + (lng_centers[1] - lng_centers[0])**2)**0.5
+    distance_km = timeslot_distance_deg * 111
+    
+    print(f"\nGrid cell Width (approx): {distance_km:.3f} km")
+    
+    if avg_speed_kmh <= 0:
+        time_minutes = 15.0
+    else:
+        time_hours = distance_km / avg_speed_kmh
+        time_minutes = time_hours * 60
+        print(f"Using average speed: {avg_speed_kmh} km/h")
+        print(f"CALCULATED travel time / timeslot duration: {time_minutes:.2f} minutes")
+    
+    # --- 0. PRE-PROCESSING (Build Temporal Profile) ---
+    calls_df[timestamp_col] = pd.to_datetime(calls_df[timestamp_col], errors='coerce')
+    calls_df.dropna(subset=[timestamp_col], inplace=True)
+    
+    total_minutes_in_day = 24 * 60
+    if time_minutes < 1: 
+        time_minutes = 1.0
+        
+    num_slots_per_day = int(np.ceil(total_minutes_in_day / time_minutes))
+    
+    # We are only analyzing 1 year, so we set this to the 365 from the original file
+    num_days_to_simulate = 365 # This is now just 'num_days_in_sample'
+    
+    print(f"Calculated {num_slots_per_day} timeslots of {time_minutes:.2f} minutes each for a 24h period.")
+   
+
+    # --- Create the Temporal Profile (for an average day) ---
+    calls_df['minute_of_day'] = calls_df[timestamp_col].dt.hour * 60 + calls_df[timestamp_col].dt.minute
+    calls_df['timeslot_index'] = (calls_df['minute_of_day'] // time_minutes).astype(int)
+    calls_per_slot = calls_df.groupby('timeslot_index').size()
+    calls_per_slot = calls_per_slot.reindex(range(num_slots_per_day), fill_value=0)
+    total_calls_in_sample = calls_per_slot.sum()
+    
+    if total_calls_in_sample > 0:
+        temporal_profile = calls_per_slot / total_calls_in_sample
+    else:
+        print("No calls in sample to build temporal profile.")
+        return
+
+    # --- 2. CALCULATE SPATIAL EXPECTATION (LAMBDA) ---
+    MODEL_WEIGHT = 0.5 
+    
+
+    mu_rows = C_ij.mean(axis=1)
+    mu_cols = C_ij.mean(axis=0)
+    mu_grand = C_ij.mean()
+    
+    lambda_ij = np.zeros((grids_lat, grids_lng))
+    
+    for i in range(grids_lat):
+        for j in range(grids_lng):
+            model_val = max(0, mu_rows[i] + mu_cols[j] - mu_grand)
+            actual_val = C_ij[i, j]
+            blended_val = (MODEL_WEIGHT * model_val) + ((1 - MODEL_WEIGHT) * actual_val)
+            lambda_ij[i, j] = max(0, blended_val) 
+
+    if lambda_ij.sum() > 0:
+        lambda_total = lambda_ij.sum()
+        actual_total = C_ij.sum()
+        # Scale the blended model to have the same total as the actual data
+        lambda_ij = (lambda_ij / lambda_total) * actual_total
+    
+    # --- 5. PLACE AMBULANCES ---
+    
+    # We now base this on the ACTUAL total calls (C_ij.sum())
+    total_actual_calls = C_ij.sum()
+    total_daily_calls = total_actual_calls / num_days_to_simulate 
+    ambulance_locations = np.zeros((grids_lat, grids_lng), dtype=int)
+    num_ambulances = 0
+    
+    print(f"\n--- Ambulance Deployment ---")
+    
+    if total_actual_calls > 0:
+        
+        # Base fleet size on 80% of AVERAGE DAILY CALLS
+        num_ambulances = int(np.round(total_daily_calls * 0.80))
+        
+        print(f"Total actual yearly calls: {total_actual_calls}")
+        print(f"Average actual daily calls: {total_daily_calls:.2f}")
+        # print(f"Busiest (peak) timeslot had: {peak_calls_in_one_slot} calls") # <-- This cannot be calculated without simulation
+        print(f"Deploying {num_ambulances} ambulances (80% of AVERAGE DAILY calls).")
+
+        # Distribute ambulances based on the *yearly* expected model (lambda_ij)
+        if lambda_ij.sum() > 0:
+            call_proportions_matrix = lambda_ij / lambda_ij.sum()
+            flat_proportions = call_proportions_matrix.flatten()
+            cell_indices = np.arange(grids_lat * grids_lng)
+            
+            chosen_indices = np.random.choice(
+                cell_indices, 
+                size=num_ambulances, 
+                p=flat_proportions, 
+                replace=True
+            )
+            
+            for idx in chosen_indices:
+                i, j = np.unravel_index(idx, (grids_lat, grids_lng))
+                ambulance_locations[i, j] += 1
+        else:
+            print("Cannot deploy ambulances: Expected call model (lambda_ij) is zero.")
+            
+    else:
+        print("No calls in data, so no ambulances deployed.")
+
+
+    
+    # --- 6. OUTPUT RESULTS ---
+    
+    
+    print(f"\nActual Call Counts Matrix (Average Daily from 1-year sample):")
+    # Divide the yearly C_ij matrix by the number of days
+    print(pd.DataFrame(C_ij / num_days_to_simulate, index=[f'Row {i+1} (Lat)' for i in range(grids_lat)],columns=[f'Col {j+1} (Lng)' for j in range(grids_lng)]).to_string(float_format="%.0f"))
+
+    #print("\nExpected Lambda (Blended Model - Average Daily):")
+    # Divide the yearly lambda_ij matrix by the number of days
+    #print(pd.DataFrame(lambda_ij / num_days_to_simulate,index=[f'Row {i+1} (Lat)'for i in range(grids_lat)],columns=[f'Col {j+1} (Lng)' for j in range(grids_lng)]).to_string(float_format="%.0f"))
+
+    # --- REMOVED THE "Target Simulated Call Counts" MATRIX ---
+
+    print("\nAmbulance Deployment Matrix (This is a total, not an average):")
+    # This matrix is NOT a rate, so we don't divide it.
+    print(pd.DataFrame( ambulance_locations,index=[f'Row {i+1} (Lat)' for i in range(grids_lat)],columns=[f'Col {j+1} (Lng)' for j in range(grids_lng)]).to_string())
+
+    # --- REMOVED THE "Final Generated Call-by-Call DataFrame" OUTPUT ---
+
+
+# --- Main block (unchanged from last time) ---
+if __name__ == "__main__":
+    
+    # --- Configuration ---
+    FILE_NAME = r"D:\Downloads\sf_calls.csv"
+    GRID_ROWS = 4
+    GRID_COLS = 4
+    AVG_VEHICLE_SPEED_KMH = 50.0
+    SIMULATION_YEAR = 2024 # <-- SET THE YEAR YOU WANT TO MODEL
+    
+
+    # --- Column Names ---
+    TIMESTAMP_COLUMN = 'Entry DtTm'
+    LOCATION_COLUMN = 'case_location'
+    LAT_COLUMN_NEW = 'lat'
+    LNG_COLUMN_NEW = 'lng'
+
+    
+    try:
+        calls = pd.read_csv(FILE_NAME)
+        
+        
+        # --- Data Cleaning & Parsing ---
+        
+        regex_pattern = r'POINT \((.*?)\s(.*?)\)'
+        calls[[LNG_COLUMN_NEW, LAT_COLUMN_NEW]] = calls[LOCATION_COLUMN].str.extract(regex_pattern)
+        calls[LAT_COLUMN_NEW] = pd.to_numeric(calls[LAT_COLUMN_NEW], errors='coerce')
+        calls[LNG_COLUMN_NEW] = pd.to_numeric(calls[LNG_COLUMN_NEW], errors='coerce')
+        
+        # (Using dayfirst=True based on your original code)
+        calls[TIMESTAMP_COLUMN] = pd.to_datetime(calls[TIMESTAMP_COLUMN], dayfirst=True, errors='coerce')
+
+        # --- Dropping bad rows ---
+        
+        original_count = len(calls)
+        calls.dropna(subset=[TIMESTAMP_COLUMN, LAT_COLUMN_NEW, LNG_COLUMN_NEW], inplace=True)
+        print(f"Dropped {original_count - len(calls)} rows with missing/invalid data.")
+        print(f"Remaining valid rows: {len(calls)}")
+        
+        if len(calls) == 0:
+            print("\n*** ERROR: All rows were dropped. ***")
+        else:
+            
+            # --- NEW: Filter for the simulation year ---
+            
+            calls_for_year = calls[calls[TIMESTAMP_COLUMN].dt.year == SIMULATION_YEAR].copy()
+            
+            if len(calls_for_year) == 0:
+                print(f"*** ERROR: No data found for the year {SIMULATION_YEAR}. ***")
+                print("Please check your data or change the 'SIMULATION_YEAR' variable.")
+            else:
+                print(f"Found {len(calls_for_year)} records for {SIMULATION_YEAR}.")
+            
+                
+
+                # --- Call the updated function ---
+                generate_combined_calls(
+                    calls_for_year, 
+                    timestamp_col=TIMESTAMP_COLUMN,
+                    lat_col=LAT_COLUMN_NEW,
+                    lng_col=LNG_COLUMN_NEW,
+                    grids_lat=GRID_ROWS, 
+                    grids_lng=GRID_COLS,
+                    avg_speed_kmh=AVG_VEHICLE_SPEED_KMH
+                )
+
+    except FileNotFoundError:
+        print(f"Error: '{FILE_NAME}' not found. Please make sure the file is in the same directory.")
+    except Exception as e:
+        print(f"An unexpected error occurred during execution: {e}")
